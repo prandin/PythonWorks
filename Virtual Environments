@@ -1,0 +1,16 @@
+#To create a virtual environment using cmd
+#To get all dependencies
+conda create -n env_name python=3.8.5 anaconda
+
+#To get very basic dependencies:
+conda create -n env_name python=3.8.5
+
+#to install the library
+conda activate env_name
+
+#Go to location --> Scripts, activate conda, and install as usual
+conda install -n env_name package_name
+
+#or
+
+pip install package_name
