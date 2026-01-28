@@ -11,9 +11,7 @@ def indent(level: int) -> str:
     return "\t" * level
 
 def flatten(node, cls):
-    """
-    Flatten left-deep AND / OR trees into a list.
-    """
+    """Flatten left-deep AND / OR trees."""
     if isinstance(node, cls):
         return flatten(node.left, cls) + flatten(node.right, cls)
     return [node]
@@ -23,14 +21,12 @@ def flatten(node, cls):
 # --------------------------------------------------
 
 def translate_function(node: exp.Expression) -> str:
-    """
-    Translate SQL functions into English.
-    """
+    """Translate SQL functions into English."""
     # UPPER(TRIM(col))
     if isinstance(node, exp.Upper) and isinstance(node.this, exp.Trim):
-        attr = node.this.this.sql()
+        col = node.this.this.sql()
         return (
-            f"the upper-case version of {attr} "
+            f"the upper-case version of {col} "
             f"after removing leading and trailing whitespace"
         )
 
@@ -50,51 +46,29 @@ def translate_function(node: exp.Expression) -> str:
 # --------------------------------------------------
 
 def detect_null_check(node):
-    """
-    Detect:
-      - X IS NULL
-      - NOT (X IS NULL)
-    """
+    """Detect IS NULL / NOT IS NULL."""
     if isinstance(node, exp.Not) and isinstance(node.this, exp.Is):
-        lhs = node.this.this.sql()
-        return "is_not_null", lhs
+        return "is_not_null", node.this.this.sql()
 
     if isinstance(node, exp.Is):
-        lhs = node.this.sql()
-        return "is_null", lhs
+        return "is_null", node.this.sql()
 
     return None, None
-
-# --------------------------------------------------
-# Operator mapping
-# --------------------------------------------------
-
-OP_MAP = {
-    "=": "equals",
-    "==": "equals",
-    "<": "is less than",
-    "<=": "is less than or equal to",
-    ">": "is greater than",
-    ">=": "is greater than or equal to",
-}
 
 # --------------------------------------------------
 # Core expression explainer
 # --------------------------------------------------
 
 def explain_expression(node, level: int, path: list[int]) -> str:
-    """
-    Recursively explain an AST node with hierarchical numbering.
-    """
     label = ".".join(map(str, path))
     prefix = f"{indent(level)}Condition {label}: "
 
     # ---- NULL checks ----
     kind, lhs = detect_null_check(node)
-    if kind == "is_not_null":
-        return prefix + f"{lhs} is not null"
     if kind == "is_null":
         return prefix + f"{lhs} is null"
+    if kind == "is_not_null":
+        return prefix + f"{lhs} is not null"
 
     # ---- AND ----
     if isinstance(node, exp.And):
@@ -118,45 +92,48 @@ def explain_expression(node, level: int, path: list[int]) -> str:
         values = ", ".join(v.sql() for v in node.expressions)
         return prefix + f"{lhs} is one of ({values})"
 
-    # ---- NOT EQUAL (<> / !=) ----
-    if isinstance(node, (exp.NEQ, exp.NotEq)):
-        left = translate_function(node.left)
-        right = node.right.sql()
-        return prefix + f"{left} is not equal to {right}"
-
     # ---- LIKE ----
     if isinstance(node, exp.Like):
-        left = translate_function(node.this)
+        lhs = translate_function(node.this)
         pattern = node.expression.sql().strip("'")
 
         # %X% → contains substring
         if pattern.startswith("%") and pattern.endswith("%") and "_" not in pattern:
             substring = pattern.strip("%")
-            return prefix + f"{left} contains '{substring}' as a substring"
+            return prefix + f"{lhs} contains '{substring}' as a substring"
 
-        return prefix + f"{left} matches the pattern '{pattern}'"
+        return prefix + f"{lhs} matches the pattern '{pattern}'"
 
     # ---- NOT LIKE ----
     if isinstance(node, exp.Not) and isinstance(node.this, exp.Like):
         inner = node.this
-        left = translate_function(inner.this)
+        lhs = translate_function(inner.this)
         pattern = inner.expression.sql().strip("'")
 
         if pattern.startswith("%") and pattern.endswith("%") and "_" not in pattern:
             substring = pattern.strip("%")
-            return prefix + f"{left} does not contain '{substring}' as a substring"
+            return prefix + f"{lhs} does not contain '{substring}' as a substring"
 
-        return prefix + f"{left} does not match the pattern '{pattern}'"
+        return prefix + f"{lhs} does not match the pattern '{pattern}'"
 
-    # ---- Generic binary operators (=, <, >, etc.) ----
+    # ---- Binary operators (=, <>, !=, <, <=, >, >=) ----
     if isinstance(node, exp.Binary):
-        left = translate_function(node.left)
-        right = node.right.sql()
-        op = getattr(node, "op", None)
-        op_text = OP_MAP.get(op, op)
+        lhs = translate_function(node.left)
+        rhs = node.right.sql()
+        op = node.op
 
-        if op_text:
-            return prefix + f"{left} {op_text} {right}"
+        if op in ("<>", "!="):
+            return prefix + f"{lhs} is not equal to {rhs}"
+        if op == "=":
+            return prefix + f"{lhs} equals {rhs}"
+        if op == "<":
+            return prefix + f"{lhs} is less than {rhs}"
+        if op == "<=":
+            return prefix + f"{lhs} is less than or equal to {rhs}"
+        if op == ">":
+            return prefix + f"{lhs} is greater than {rhs}"
+        if op == ">=":
+            return prefix + f"{lhs} is greater than or equal to {rhs}"
 
         return prefix + node.sql()
 
@@ -168,9 +145,6 @@ def explain_expression(node, level: int, path: list[int]) -> str:
 # --------------------------------------------------
 
 def find_case_and_alias(parsed):
-    """
-    Locate the CASE expression and alias (AS column_name).
-    """
     cases = list(parsed.find_all(exp.Case))
     if not cases:
         return None, None
@@ -212,7 +186,6 @@ def explain_case_with_header(sql_text: str) -> str:
         cond = when.this
         result = when.args.get("true")
 
-        # Compound condition
         if isinstance(cond, (exp.And, exp.Or)):
             output.append(f"Condition {i}: IF")
             output.append(explain_expression(cond, 1, [i, 1]))
@@ -232,7 +205,4 @@ def explain_case_with_header(sql_text: str) -> str:
 # --------------------------------------------------
 
 def translate_sql(sql_text: str) -> str:
-    """
-    Public entry point.
-    """
     return explain_case_with_header(sql_text)
