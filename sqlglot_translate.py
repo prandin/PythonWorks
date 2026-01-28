@@ -1,64 +1,88 @@
+import re
 import sqlglot
 from sqlglot import exp
+
+
+# -------------------------
+# Utility helpers
+# -------------------------
 
 def indent(level: int) -> str:
     return "\t" * level
 
+
 def flatten(node, cls):
-    """Flatten left-deep AND/OR trees into a list of child expressions."""
+    """
+    Flatten left-deep AND / OR trees into a list.
+    """
     if isinstance(node, cls):
         return flatten(node.left, cls) + flatten(node.right, cls)
     return [node]
 
+
+# -------------------------
+# Function translation
+# -------------------------
+
 def translate_function(node: exp.Expression) -> str:
-    """Translate common composed functions to human English."""
-    # Handle UPPER(TRIM(x)) pattern
+    """
+    Translate SQL functions into English.
+    """
+    # UPPER(TRIM(x))
     if isinstance(node, exp.Upper) and isinstance(node.this, exp.Trim):
         attr = node.this.this.sql()
         return (
             f"the upper-case version of {attr} "
             f"after removing leading and trailing whitespace"
         )
-    # If node is a Trim alone: describe it
+
+    # TRIM(x)
     if isinstance(node, exp.Trim):
         return f"the value of {node.this.sql()} after trimming whitespace"
+
     # Generic function fallback
     if isinstance(node, exp.Func):
         return f"the result of {node.sql()}"
-    # If it's a column/identifier expression, return its SQL
+
     return node.sql()
+
+
+# -------------------------
+# NULL detection
+# -------------------------
 
 def detect_null_check(node):
     """
-    Detect patterns:
-      - X IS NULL  -> returns ('is_null', lhs_sql)
-      - NOT (X IS NULL) -> returns ('is_not_null', lhs_sql)
-    Returns (kind, lhs_sql) where kind is 'is_null'/'is_not_null' or (None, None).
+    Detect:
+      - X IS NULL
+      - NOT (X IS NULL)
     """
-    # Case: NOT (X IS NULL)
+    # NOT (X IS NULL)
     if isinstance(node, exp.Not) and isinstance(node.this, exp.Is):
         inner = node.this
-        lhs_sql = inner.this.sql()
-        # try common attributes for right/null node
-        right = getattr(inner, "expression", None) or getattr(inner, "right", None) or getattr(inner, "args", {}).get("expression", None)
-        if isinstance(right, exp.Null) or (right is None and 'NULL' in inner.sql().upper()):
-            return "is_not_null", lhs_sql
+        lhs = inner.this.sql()
+        return "is_not_null", lhs
 
-    # Case: X IS NULL
+    # X IS NULL
     if isinstance(node, exp.Is):
-        lhs_sql = node.this.sql()
-        right = getattr(node, "expression", None) or getattr(node, "right", None) or getattr(node, "args", {}).get("expression", None)
-        if isinstance(right, exp.Null) or (right is None and 'NULL' in node.sql().upper()):
-            return "is_null", lhs_sql
+        lhs = node.this.sql()
+        return "is_null", lhs
 
     return None, None
 
+
+# -------------------------
+# Recursive explanation
+# -------------------------
+
 def explain_expression(node, level: int, path: list[int]) -> str:
-    """Recursively explain node with stable numbering (path is the hierarchical index list)."""
+    """
+    Recursively explain an AST expression with hierarchical numbering.
+    """
     label = ".".join(map(str, path))
     prefix = f"{indent(level)}Condition {label}: "
 
-    # Null checks (covers NOT ... IS NULL and X IS NULL)
+    # NULL checks
     kind, lhs = detect_null_check(node)
     if kind == "is_not_null":
         return prefix + f"{lhs} is not null"
@@ -87,40 +111,82 @@ def explain_expression(node, level: int, path: list[int]) -> str:
         values = ", ".join(v.sql() for v in node.expressions)
         return prefix + f"{lhs} is one of ({values})"
 
-    # Binary comparisons (=, <, >, etc.)
+    # Binary comparison (=, <, >, etc.)
     if isinstance(node, exp.Binary):
         left = translate_function(node.left)
-        # right may be an expression or literal
         right = node.right.sql()
         return prefix + f"{left} {node.op} {right}"
 
-    # Function call or identifier fallback
-    if isinstance(node, exp.Func) or isinstance(node, exp.Column) or isinstance(node, exp.Identifier):
-        return prefix + translate_function(node)
-
-    # Generic fallback to SQL text
+    # Fallback
     return prefix + node.sql()
 
-def explain_case(case_expr: exp.Case) -> str:
-    output = []
-    output.append("CASE evaluation logic:\n")
 
-    for i, when in enumerate(case_expr.args["ifs"], 1):
-        # when.this is the condition expression
-        # when.args['true'] is the result expression
+# -------------------------
+# CASE + alias extraction
+# -------------------------
+
+def find_case_and_alias(parsed):
+    """
+    Extract the CASE expression and its alias (AS <column_name>).
+    """
+    case_nodes = list(parsed.find_all(exp.Case))
+    if not case_nodes:
+        return None, None
+
+    case = case_nodes[0]
+
+    # Preferred: AST-based alias detection
+    for alias in parsed.find_all(exp.Alias):
+        if alias.this is case:
+            return case, alias.alias
+
+    # Fallback: regex at end
+    m = re.search(r"\bAS\s+([A-Za-z0-9_]+)\s*$", parsed.sql(), re.IGNORECASE)
+    if m:
+        return case, m.group(1)
+
+    return case, None
+
+
+# -------------------------
+# CASE explanation
+# -------------------------
+
+def explain_case_with_header(sql_text: str) -> str:
+    parsed = sqlglot.parse_one(sql_text)
+    case_node, alias_name = find_case_and_alias(parsed)
+
+    if case_node is None:
+        raise ValueError("No CASE expression found")
+
+    header = (
+        f"Column '{alias_name}' is computed as:"
+        if alias_name
+        else "Computed column is derived as:"
+    )
+
+    output = [header, ""]
+
+    for i, when in enumerate(case_node.args.get("ifs", []), 1):
         output.append(f"Condition {i}: IF")
-        output.append(explain_expression(when.this, level=1, path=[i, 1]))
-        output.append(f"\tTHEN return '{when.args['true'].sql()}'\n")
+        output.append(
+            explain_expression(
+                when.this,
+                level=1,
+                path=[i, 1]
+            )
+        )
+        output.append(f"\tTHEN return {when.args['true'].sql()}\n")
 
-    default = case_expr.args.get("default")
+    default = case_node.args.get("default")
     if default:
-        output.append(f"ELSE return '{default.sql()}'")
+        output.append(f"ELSE return {default.sql()}")
 
     return "\n".join(output)
 
-def translate_sql_case(sql_text: str) -> str:
-    parsed = sqlglot.parse_one(sql_text)
-    case_nodes = list(parsed.find_all(exp.Case))
-    if not case_nodes:
-        raise ValueError("No CASE expression found")
-    return explain_case(case_nodes[0])
+def translate_sql(sql_text: str) -> str:
+    """
+    Public API.
+    Call this function.
+    """
+    return explain_case_with_header(sql_text)
