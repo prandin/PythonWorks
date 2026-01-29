@@ -16,27 +16,25 @@ def flatten(node, cls):
     return [node]
 
 # --------------------------------------------------
-# Function / expression translation
+# Expression translation
 # --------------------------------------------------
 
 def translate_expression(node: exp.Expression) -> str:
-    """
-    Translate expressions into controlled English.
-    """
-
-    # ---------- Column / literal ----------
+    # Column / literal
     if isinstance(node, (exp.Column, exp.Identifier, exp.Literal)):
         return node.sql()
 
-    # ---------- TRIM family ----------
-    if isinstance(node, exp.LTrim):
-        return f"{translate_expression(node.this)} with leading whitespace removed"
-
-    if isinstance(node, exp.RTrim):
-        return f"{translate_expression(node.this)} with trailing whitespace removed"
-
+    # ---------- TRIM (LTRIM / RTRIM / BOTH) ----------
     if isinstance(node, exp.Trim):
-        return f"{translate_expression(node.this)} with leading and trailing whitespace removed"
+        expr = translate_expression(node.this)
+        where = node.args.get("where")
+
+        if where == "LEADING":
+            return f"{expr} with leading whitespace removed"
+        if where == "TRAILING":
+            return f"{expr} with trailing whitespace removed"
+
+        return f"{expr} with leading and trailing whitespace removed"
 
     # ---------- UPPER ----------
     if isinstance(node, exp.Upper):
@@ -96,14 +94,12 @@ def explain_expression(node, level: int, path: list[int]) -> str:
     label = ".".join(map(str, path))
     prefix = f"{indent(level)}Condition {label}: "
 
-    # ---- NULL checks ----
     kind, lhs = detect_null_check(node)
     if kind == "is_null":
         return prefix + f"{lhs} is null"
     if kind == "is_not_null":
         return prefix + f"{lhs} is not null"
 
-    # ---- AND ----
     if isinstance(node, exp.And):
         parts = flatten(node, exp.And)
         text = prefix + "All of the following must be true:\n"
@@ -111,7 +107,6 @@ def explain_expression(node, level: int, path: list[int]) -> str:
             text += explain_expression(part, level + 1, path + [i]) + "\n"
         return text.rstrip()
 
-    # ---- OR ----
     if isinstance(node, exp.Or):
         parts = flatten(node, exp.Or)
         text = prefix + "At least one of the following must be true:\n"
@@ -119,13 +114,11 @@ def explain_expression(node, level: int, path: list[int]) -> str:
             text += explain_expression(part, level + 1, path + [i]) + "\n"
         return text.rstrip()
 
-    # ---- IN ----
     if isinstance(node, exp.In):
         lhs = translate_expression(node.this)
         values = ", ".join(v.sql() for v in node.expressions)
         return prefix + f"{lhs} is one of ({values})"
 
-    # ---- LIKE ----
     if isinstance(node, exp.Like):
         lhs = translate_expression(node.this)
         pattern = node.expression.sql().strip("'")
@@ -133,16 +126,13 @@ def explain_expression(node, level: int, path: list[int]) -> str:
             return prefix + f"{lhs} contains '{pattern.strip('%')}' as a substring"
         return prefix + f"{lhs} matches the pattern '{pattern}'"
 
-    # ---- NOT LIKE ----
     if isinstance(node, exp.Not) and isinstance(node.this, exp.Like):
-        inner = node.this
-        lhs = translate_expression(inner.this)
-        pattern = inner.expression.sql().strip("'")
+        lhs = translate_expression(node.this.this)
+        pattern = node.this.expression.sql().strip("'")
         if pattern.startswith("%") and pattern.endswith("%") and "_" not in pattern:
             return prefix + f"{lhs} does not contain '{pattern.strip('%')}' as a substring"
         return prefix + f"{lhs} does not match the pattern '{pattern}'"
 
-    # ---- Binary comparisons ----
     if isinstance(node, exp.Binary):
         lhs = translate_expression(node.left)
         rhs = translate_expression(node.right)
@@ -161,7 +151,6 @@ def explain_expression(node, level: int, path: list[int]) -> str:
         if op == ">=":
             return prefix + f"{lhs} is greater than or equal to {rhs}"
 
-    # ---- Fallback ----
     return prefix + node.sql()
 
 # --------------------------------------------------
