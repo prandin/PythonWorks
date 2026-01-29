@@ -3,31 +3,34 @@ import sqlglot
 from sqlglot import expressions as exp
 
 
-# ---------------------------
-# Public entry point
-# ---------------------------
+# =====================================================
+# PUBLIC ENTRY POINT
+# =====================================================
 
 def translate_sql(sql_text: str) -> str:
     return explain_case_with_header(sql_text)
 
 
-# ---------------------------
-# CASE handling
-# ---------------------------
+# =====================================================
+# CASE + HEADER
+# =====================================================
 
 def explain_case_with_header(sql_text: str) -> str:
     parsed = sqlglot.parse_one(sql_text)
-    case = parsed.find(exp.Case)
 
     alias = None
     if isinstance(parsed, exp.Alias):
         alias = parsed.alias
+        case = parsed.this
+    else:
+        case = parsed.find(exp.Case)
 
     header = ""
     if alias:
         header = f"Column '{alias}' is computed as:\n\n"
 
     output = []
+
     for i, cond in enumerate(case.args.get("ifs", []), start=1):
         output.append(f"Condition {i}: IF")
         output.append(explain_expression(cond.this, 1, [i]))
@@ -39,21 +42,22 @@ def explain_case_with_header(sql_text: str) -> str:
     return header + "\n".join(output)
 
 
-# ---------------------------
-# Recursive explanation
-# ---------------------------
+# =====================================================
+# CONDITION EXPLANATION (NUMBERED)
+# =====================================================
 
 def explain_expression(node, level: int, path: List[int]) -> str:
     prefix = "    " * level
-    label = "Condition " + ".".join(map(str, path)) + ": "
+    label = f"Condition {'.'.join(map(str, path))}: "
 
-    # AND / OR
+    # AND
     if isinstance(node, exp.And):
         lines = [prefix + label + "All of the following must be true:"]
         for i, part in enumerate(node.flatten(), start=1):
             lines.append(explain_expression(part, level + 1, path + [i]))
         return "\n".join(lines)
 
+    # OR
     if isinstance(node, exp.Or):
         lines = [prefix + label + "At least one of the following must be true:"]
         for i, part in enumerate(node.flatten(), start=1):
@@ -65,7 +69,7 @@ def explain_expression(node, level: int, path: List[int]) -> str:
         lhs = translate_expression(node.left)
         rhs = translate_expression(node.right)
 
-        op_map = {
+        ops = {
             exp.EQ: "equals",
             exp.NEQ: "is not equal to",
             exp.LT: "is less than",
@@ -73,53 +77,47 @@ def explain_expression(node, level: int, path: List[int]) -> str:
             exp.GT: "is greater than",
             exp.GTE: "is greater than or equal to",
         }
+        return prefix + label + f"{lhs} {ops[type(node)]} {rhs}"
 
-        return prefix + label + f"{lhs} {op_map[type(node)]} {rhs}"
-
-    # LIKE / NOT LIKE
+    # LIKE
     if isinstance(node, exp.Like):
-        lhs = translate_expression(node.this)
-        rhs = translate_expression(node.expression)
-        return prefix + label + f"{lhs} contains {rhs} as a substring"
+        return prefix + label + f"{translate_expression(node.this)} contains {translate_expression(node.expression)} as a substring"
 
     if isinstance(node, exp.NotLike):
-        lhs = translate_expression(node.this)
-        rhs = translate_expression(node.expression)
-        return prefix + label + f"{lhs} does not contain {rhs} as a substring"
+        return prefix + label + f"{translate_expression(node.this)} does not contain {translate_expression(node.expression)} as a substring"
 
     # IN
     if isinstance(node, exp.In):
-        lhs = translate_expression(node.this)
         values = ", ".join(translate_expression(v) for v in node.expressions)
-        return prefix + label + f"{lhs} is one of ({values})"
+        return prefix + label + f"{translate_expression(node.this)} is one of ({values})"
 
-    # NULL checks
+    # NULL
     if isinstance(node, exp.Is):
-        lhs = translate_expression(node.this)
-        return prefix + label + f"{lhs} is null"
+        return prefix + label + f"{translate_expression(node.this)} is null"
 
     if isinstance(node, exp.IsNot):
-        lhs = translate_expression(node.this)
-        return prefix + label + f"{lhs} is not null"
+        return prefix + label + f"{translate_expression(node.this)} is not null"
 
-    # Fallback (safe)
+    # Fallback → translate expression, NOT sql()
     return prefix + label + translate_expression(node)
 
 
-# ---------------------------
-# Expression translation
-# ---------------------------
+# =====================================================
+# EXPRESSION TRANSLATION (FULL RECURSION)
+# =====================================================
 
 def translate_expression(node) -> str:
     if node is None:
         return ""
 
+    # Columns / literals
     if isinstance(node, exp.Column):
         return node.sql()
 
     if isinstance(node, exp.Literal):
         return node.sql()
 
+    # Arithmetic
     if isinstance(node, exp.Add):
         return f"{translate_expression(node.left)} plus {translate_expression(node.right)}"
 
@@ -132,7 +130,11 @@ def translate_expression(node) -> str:
     if isinstance(node, exp.Div):
         return f"{translate_expression(node.left)} divided by {translate_expression(node.right)}"
 
-    # -------- Functions --------
+    # Parentheses
+    if isinstance(node, exp.Paren):
+        return translate_expression(node.this)
+
+    # ================= FUNCTIONS =================
 
     if isinstance(node, exp.Coalesce):
         args = ", ".join(translate_expression(a) for a in node.expressions)
@@ -151,13 +153,28 @@ def translate_expression(node) -> str:
     if isinstance(node, exp.Trim):
         return f"{translate_expression(node.this)} with whitespace removed"
 
-    # sqlglot represents LTRIM/RTRIM as Trim with flags
-    if isinstance(node, exp.Trim):
-        return f"{translate_expression(node.this)} with whitespace removed"
+    # ================= WINDOW FUNCTIONS =================
 
-    # Parentheses
-    if isinstance(node, exp.Paren):
-        return translate_expression(node.this)
+    if isinstance(node, exp.Window):
+        base = translate_expression(node.this)
+        parts = []
 
-    # Default safe fallback
+        if node.args.get("partition_by"):
+            cols = ", ".join(c.sql() for c in node.args["partition_by"])
+            parts.append(f"partitioned by {cols}")
+
+        if node.args.get("order"):
+            parts.append("ordered")
+
+        suffix = ""
+        if parts:
+            suffix = " (" + ", ".join(parts) + ")"
+
+        return base + suffix
+
+    # CASE inside expressions
+    if isinstance(node, exp.Case):
+        return "a conditional value based on multiple conditions"
+
+    # LAST SAFE FALLBACK
     return node.sql()
