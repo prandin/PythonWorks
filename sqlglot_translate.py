@@ -1,98 +1,117 @@
-from sqlglot import parse_one, exp
+from typing import List
+from sqlglot import parse_one, expressions as exp
 
 
-# -------------------------------
-# Public API
-# -------------------------------
+# ----------------------------
+# Formatting helpers
+# ----------------------------
+
+def indent(level: int) -> str:
+    return "  " * level
+
+
+# ----------------------------
+# Entry point
+# ----------------------------
+
 def translate_sql(sql_text: str) -> str:
-    return explain_case_with_header(sql_text)
+    tree = parse_one(sql_text)
+    return explain_case_with_header(tree)
 
 
-# -------------------------------
-# CASE with column header
-# -------------------------------
+# ----------------------------
+# CASE handling
+# ----------------------------
+
 def explain_case_with_header(sql_text: str) -> str:
     tree = parse_one(sql_text)
+
     case = tree.find(exp.Case)
+    if not case:
+        return translate_expression(tree)
 
-    alias = None
-    if isinstance(tree, exp.Alias):
-        alias = tree.alias
-
-    header = ""
-    if alias:
-        header = f"Column '{alias}' is computed as:\n\n"
-
+    header = "Column is computed as:\n\n"
     return header + explain_case(case, 1)
 
 
-# -------------------------------
-# CASE explanation
-# -------------------------------
 def explain_case(case: exp.Case, level: int) -> str:
+    """
+    Correctly walks sqlglot CASE as a chain of exp.If nodes
+    """
     out = []
     idx = 1
 
-    for cond, result in case.args.get("ifs", []):
+    current = case.args.get("ifs")
+
+    while isinstance(current, exp.If):
+        cond = current.this
+        result = current.args.get("true")
+
         out.append(f"{indent(level)}Condition {idx}: IF")
         out.append(explain_condition(cond, level + 1, [idx]))
         out.append(
             f"{indent(level + 1)}THEN return {translate_expression(result)}"
         )
-        idx += 1
 
-    if case.args.get("default"):
+        idx += 1
+        current = current.args.get("false")
+
+    # ELSE
+    if current is not None:
         out.append(
-            f"{indent(level)}ELSE return {translate_expression(case.args['default'])}"
+            f"{indent(level)}ELSE return {translate_expression(current)}"
         )
 
     return "\n".join(out)
 
 
-def explain_condition(node, level: int, path: list[int]) -> str:
-    prefix = f"{indent(level)}Condition {'.'.join(map(str, path))}: "
+# ----------------------------
+# Conditions
+# ----------------------------
+
+def explain_condition(node, level: int, path: List[int]) -> str:
+    label = ".".join(map(str, path))
 
     if isinstance(node, exp.And):
-        lines = [prefix + "All of the following must be true:"]
-        i = 1
-        for arg in node.flatten():
-            lines.append(explain_condition(arg, level + 1, path + [i]))
-            i += 1
-        return "\n".join(lines)
+        out = [
+            f"{indent(level)}Condition {label}: All of the following must be true:"
+        ]
+        for i, part in enumerate(node.flatten(), 1):
+            out.append(
+                explain_condition(part, level + 1, path + [i])
+            )
+        return "\n".join(out)
 
-    return prefix + translate_expression(node)
+    if isinstance(node, exp.Or):
+        out = [
+            f"{indent(level)}Condition {label}: At least one of the following must be true:"
+        ]
+        for i, part in enumerate(node.flatten(), 1):
+            out.append(
+                explain_condition(part, level + 1, path + [i])
+            )
+        return "\n".join(out)
+
+    return f"{indent(level)}Condition {label}: {translate_expression(node)}"
 
 
-# -------------------------------
+# ----------------------------
 # Expression translation
-# -------------------------------
+# ----------------------------
+
 def translate_expression(node) -> str:
     if node is None:
         return "NULL"
 
-    # Nested CASE
+    # CASE inside CASE
     if isinstance(node, exp.Case):
-        return "(" + explain_case(node, 0) + ")"
-
-    # CAST (FIXED — ONLY correct way)
-    if isinstance(node, exp.Cast):
-        expr = translate_expression(node.this)
-        target = node.args["to"].sql()
-        return f"{expr} cast to {target}"
-
-    # Columns
-    if isinstance(node, exp.Column):
-        return node.sql()
-
-    # Literals
-    if isinstance(node, exp.Literal):
-        return node.this
+        return f"(\n{explain_case(node, 2)}\n)"
 
     # Comparisons
     if isinstance(node, exp.EQ):
         return f"{translate_expression(node.left)} equals {translate_expression(node.right)}"
 
-    if isinstance(node, exp.NEQ):
+    if isinstance(node, (exp.NEQ, exp.Not)):
         return f"{translate_expression(node.left)} is not equal to {translate_expression(node.right)}"
 
     if isinstance(node, exp.GT):
@@ -107,62 +126,66 @@ def translate_expression(node) -> str:
     if isinstance(node, exp.LTE):
         return f"{translate_expression(node.left)} is less than or equal to {translate_expression(node.right)}"
 
+    # LIKE / NOT LIKE (string-based, no class assumptions)
+    if isinstance(node, exp.Like):
+        return f"{translate_expression(node.this)} contains {translate_expression(node.expression)}"
+
+    if isinstance(node, exp.Not) and isinstance(node.this, exp.Like):
+        like = node.this
+        return f"{translate_expression(like.this)} does not contain {translate_expression(like.expression)}"
+
     # IN / NOT IN
     if isinstance(node, exp.In):
-        values = ", ".join(translate_expression(v) for v in node.expressions)
-        if node.args.get("negated"):
-            return f"{translate_expression(node.this)} is not one of ({values})"
+        values = ", ".join(translate_expression(e) for e in node.expressions)
         return f"{translate_expression(node.this)} is one of ({values})"
 
-    # LIKE / NOT LIKE (no NotLike class exists!)
-    if isinstance(node, exp.Like):
-        lhs = translate_expression(node.this)
-        pattern = node.args["expression"].this.replace("%", "")
-        if node.args.get("negated"):
-            return f"{lhs} does not contain '{pattern}' as a substring"
-        return f"{lhs} contains '{pattern}' as a substring"
+    if isinstance(node, exp.Not) and isinstance(node.this, exp.In):
+        values = ", ".join(translate_expression(e) for e in node.this.expressions)
+        return f"{translate_expression(node.this.this)} is not one of ({values})"
+
+    # NULL checks
+    if isinstance(node, exp.Is):
+        return f"{translate_expression(node.this)} is {translate_expression(node.expression)}"
 
     # Functions
     if isinstance(node, exp.Func):
         return translate_function(node)
 
+    # Columns / literals
+    if isinstance(node, exp.Column):
+        return node.sql()
+
+    if isinstance(node, exp.Literal):
+        return node.sql()
+
+    # Fallback
     return node.sql()
 
 
-# -------------------------------
+# ----------------------------
 # Function translation
-# -------------------------------
+# ----------------------------
+
 def translate_function(node: exp.Func) -> str:
-    name = node.sql_name().upper()
-    args = [translate_expression(a) for a in node.args.get("expressions", [])]
+    name = node.name.upper()
+    args = node.expressions or []
 
     if name == "COALESCE":
-        return f"the first non-null value among ({', '.join(args)})"
+        return f"first non-null of ({', '.join(map(translate_expression, args))})"
 
     if name == "SUM":
-        return f"the sum of {args[0]}" if args else "the sum of values"
+        return f"sum of ({translate_expression(args[0])})"
 
     if name == "GREATEST":
-        return f"the maximum of ({', '.join(args)})"
+        return f"maximum of ({', '.join(map(translate_expression, args))})"
 
-    if name == "LEAST":
-        return f"the minimum of ({', '.join(args)})"
+    if name == "CAST":
+        value = translate_expression(args[0]) if args else "value"
+        target = node.args.get("to")
+        return f"{value} cast to {target.sql() if target else 'type'}"
 
-    if name == "LTRIM":
-        return f"{args[0]} with leading spaces removed"
+    if name in ("LTRIM", "RTRIM", "TRIM"):
+        return f"trimmed value of ({translate_expression(args[0])})"
 
-    if name == "RTRIM":
-        return f"{args[0]} with trailing spaces removed"
-
-    if name == "TRIM":
-        return f"{args[0]} with leading and trailing spaces removed"
-
-    # Window functions
-    if node.args.get("over"):
-        return f"{name.lower()} of {args[0]} over a window"
-
-    return node.sql()
-
-
-def indent(n: int) -> str:
-    return "  " * n
+    # Safe fallback – never crash
+    return f"{name.lower()}({', '.join(map(translate_expression, args))})"
