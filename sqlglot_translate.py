@@ -20,32 +20,26 @@ def flatten(node, cls):
 # --------------------------------------------------
 
 def translate_expression(node: exp.Expression) -> str:
-    # Column / literal
     if isinstance(node, (exp.Column, exp.Identifier, exp.Literal)):
         return node.sql()
 
-    # ---------- TRIM (LTRIM / RTRIM / BOTH) ----------
+    # TRIM / LTRIM / RTRIM
     if isinstance(node, exp.Trim):
         expr = translate_expression(node.this)
         where = node.args.get("where")
-
         if where == "LEADING":
             return f"{expr} with leading whitespace removed"
         if where == "TRAILING":
             return f"{expr} with trailing whitespace removed"
-
         return f"{expr} with leading and trailing whitespace removed"
 
-    # ---------- UPPER ----------
     if isinstance(node, exp.Upper):
         return f"the upper-case version of {translate_expression(node.this)}"
 
-    # ---------- COALESCE ----------
     if isinstance(node, exp.Coalesce):
         args = ", ".join(translate_expression(a) for a in node.expressions)
         return f"the first non-null value among ({args})"
 
-    # ---------- ROUND ----------
     if isinstance(node, exp.Round):
         expr = translate_expression(node.this)
         decimals = node.args.get("decimals")
@@ -53,11 +47,9 @@ def translate_expression(node: exp.Expression) -> str:
             return f"{expr} rounded to {decimals.sql()} decimal places"
         return f"{expr} rounded"
 
-    # ---------- SUM ----------
     if isinstance(node, exp.Sum):
         return f"the sum of {translate_expression(node.this)}"
 
-    # ---------- Arithmetic ----------
     if isinstance(node, exp.Add):
         return f"{translate_expression(node.left)} plus {translate_expression(node.right)}"
 
@@ -70,7 +62,6 @@ def translate_expression(node: exp.Expression) -> str:
     if isinstance(node, exp.Div):
         return f"{translate_expression(node.left)} divided by {translate_expression(node.right)}"
 
-    # ---------- Fallback ----------
     return f"the result of {node.sql()}"
 
 # --------------------------------------------------
@@ -80,10 +71,8 @@ def translate_expression(node: exp.Expression) -> str:
 def detect_null_check(node):
     if isinstance(node, exp.Not) and isinstance(node.this, exp.Is):
         return "is_not_null", translate_expression(node.this.this)
-
     if isinstance(node, exp.Is):
         return "is_null", translate_expression(node.this)
-
     return None, None
 
 # --------------------------------------------------
@@ -133,23 +122,24 @@ def explain_expression(node, level: int, path: list[int]) -> str:
             return prefix + f"{lhs} does not contain '{pattern.strip('%')}' as a substring"
         return prefix + f"{lhs} does not match the pattern '{pattern}'"
 
-    if isinstance(node, exp.Binary):
-        lhs = translate_expression(node.left)
-        rhs = translate_expression(node.right)
-        op = node.op
+    # ---- Comparison operators (CRITICAL FIX) ----
+    if isinstance(node, exp.EQ):
+        return prefix + f"{translate_expression(node.left)} equals {translate_expression(node.right)}"
 
-        if op in ("<>", "!="):
-            return prefix + f"{lhs} is not equal to {rhs}"
-        if op == "=":
-            return prefix + f"{lhs} equals {rhs}"
-        if op == "<":
-            return prefix + f"{lhs} is less than {rhs}"
-        if op == "<=":
-            return prefix + f"{lhs} is less than or equal to {rhs}"
-        if op == ">":
-            return prefix + f"{lhs} is greater than {rhs}"
-        if op == ">=":
-            return prefix + f"{lhs} is greater than or equal to {rhs}"
+    if isinstance(node, exp.NEQ):
+        return prefix + f"{translate_expression(node.left)} is not equal to {translate_expression(node.right)}"
+
+    if isinstance(node, exp.LT):
+        return prefix + f"{translate_expression(node.left)} is less than {translate_expression(node.right)}"
+
+    if isinstance(node, exp.LTE):
+        return prefix + f"{translate_expression(node.left)} is less than or equal to {translate_expression(node.right)}"
+
+    if isinstance(node, exp.GT):
+        return prefix + f"{translate_expression(node.left)} is greater than {translate_expression(node.right)}"
+
+    if isinstance(node, exp.GTE):
+        return prefix + f"{translate_expression(node.left)} is greater than or equal to {translate_expression(node.right)}"
 
     return prefix + node.sql()
 
